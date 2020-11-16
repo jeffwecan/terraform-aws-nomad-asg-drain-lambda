@@ -7,11 +7,19 @@ Gracefully drains nomad nodes before notifying the ASG to complete termination.
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
+import contextlib
+import logging
+import uuid
 
+from consulate.api import base
+from consulate import exceptions
 import boto3
+import consulate
+import hvac
 from dateutil.parser import parse
 from nomad import Nomad
+from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 if TYPE_CHECKING:
     from nomad.api.exceptions import BaseNomadException
@@ -27,6 +35,101 @@ NODE_DRAIN_DURATION_NS = int(os.getenv('NODE_DRAIN_DEADLINE_MINUTES', 120 * 60))
 # Maximum amount of time for a node to meet our termination conditions
 # before we go ahead and terminate it regardless
 MAX_WAIT_TIME_MINUTES = int(os.getenv('MAX_WAIT_TIME_MINUTES', 125))
+
+
+class Lock(base.Endpoint):
+    """Wrapper for easy :class:`~consulate.api.kv.KV` locks. Keys are
+    automatically prefixed with ``consulate/locks/``. To change the prefix or
+    remove it invoke the :meth:~consulate.api.lock.Lock.prefix` method.
+    Example:
+    .. code:: python
+        import consulate
+        consul = consulate.Consul()
+        with consul.lock.acquire('my-key'):
+            print('Locked: {}'.format(consul.lock.key))
+            # Do stuff
+    :raises: :exc:`~consulate.exception.LockError`
+    """
+    DEFAULT_PREFIX = 'consulate/locks'
+
+    def __init__(self, uri, adapter, session, datacenter=None, token=None):
+        """Create a new instance of the Lock
+        :param str uri: Base URI
+        :param consul.adapters.Request adapter: Request adapter
+        :param consul.api.session.Session session: Session endpoint instance
+        :param str datacenter: datacenter
+        :param str token: Access Token
+        """
+        super(Lock, self).__init__(uri, adapter, datacenter, token)
+        self._base_uri = '{0}/kv'.format(uri)
+        self._session = session
+        self._session_id = None
+        self._item = str(uuid.uuid4())
+        self._prefix = self.DEFAULT_PREFIX
+
+    @contextlib.contextmanager
+    def acquire(self, key=None, value=None):
+        """A context manager that allows you to acquire the lock, optionally
+        passing in a key and/or value.
+        :param str key: The key to lock
+        :param str value: The value to set in the lock
+        :raises: :exc:`~consulate.exception.LockError`
+        """
+        self._acquire(key, value)
+        yield
+        self._release()
+
+    @property
+    def key(self):
+        """Return the lock key
+        :rtype: str
+        """
+        return self._item
+
+    def prefix(self, value):
+        """Override the path prefix for the lock key
+        :param str value: The value to set the path prefix to
+        """
+        self._prefix = value or ''
+
+    def _acquire(self, key=None, value=None):
+        self._session_id = self._session.create()
+        self._item = '/'.join([self._prefix, (key or str(uuid.uuid4()))])
+        logger.debug('Acquiring a lock of %s for session %s',
+                     self._item, self._session_id)
+        response = self._put_response_body([self._item],
+                                           {'acquire': self._session_id},
+                                           value)
+        if not response:
+            self._session.destroy(self._session_id)
+            raise exceptions.LockFailure()
+
+    def _release(self):
+        """Release the lock"""
+        self._put_response_body([self._item], {'release': self._session_id})
+        self._adapter.delete(self._build_uri([self._item]))
+        self._session.destroy(self._session_id)
+        self._item, self._session_id = None, None
+
+
+@retry(reraise=True, wait=wait_random_exponential(multiplier=1, max=30), stop=stop_after_attempt(10))
+def retrieve_vault_client() -> 'hvac.Client':
+    """Retrieve an authenticated Vault client using lambda env vars.
+
+    Returns:
+        hvac.Client: A Vault client with an associated AWS auth-generated token.
+    """
+    vault_client = hvac.Client(
+        url=os.environ['VAULT_ADDR'],
+    )
+    vault_client.auth.aws.iam_login(
+        access_key=os.environ['AWS_ACCESS_KEY_ID'],
+        secret_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+        session_token=os.environ['AWS_SESSION_TOKEN'],
+        role=os.environ['AWS_AUTH_ROLE'],
+        mount_point=os.environ['AWS_AUTH_PATH'],
+    )
+    return vault_client
 
 
 def get_ec2_instance_private_ip(instance_id: str) -> str:
@@ -207,25 +310,42 @@ def send_asg_lifecycle_notifications(event_detail: dict, complete_action: bool) 
     return response
 
 
-def handle_asg_lifecycle_event(event, context) -> dict:
-    """Handle Nomad node ASG lifecycle events.
+def handle_instance_launch(event, lb_port=443):
+    if target_group_arns := os.getenv('LB_TARGET_GROUP_ARNS', '').split(','):
+        for target_group_arn in target_group_arns:
+            targets_list = {
+                'Id': event['detail']['EC2InstanceId'],
+                'Port': lb_port,
+            }
+            elb_client = boto3.client('elbv2')
+            reg_targets_response = elb_client.register_targets(
+                TargetGroupArn=target_group_arn,
+                Targets=targets_list,
+            )
+            if reg_targets_response['ResponseMetadata']['HTTPStatusCode'] != 200:
+                raise Exception("Register targets failed")
 
-    Note: Currently only intended to handle "terminate lifecycle" actions.
 
-    Args:
-        event: ASG Lifecycle event data provided by AWS.
-        context: Runtime information for the lambda.
+def handle_instance_terminate(event) -> dict:
 
-    Raises:
-        NotImplementedError: Raised when we receive an event with a "detail-type" other than:
-        "EC2 Instance-terminate Lifecycle Action".
-
-    Returns:
-        dict: Includes both relevant details from the original event (so that this function can call itself with its
-        own outputs) as well as information about any actions taken (e.g., if the instance was ready for termination, etc.)
-    """
-    if event['detail-type'] != 'EC2 Instance-terminate Lifecycle Action':
-        raise NotImplementedError('Only EC2 instance terminate lifecycle notifications currently supported')
+    vault_client = retrieve_vault_client()
+    consul_secrets_role = vault_client.secrets.consul.generate_credentials(
+        name=os.environ['CONSUL_SECRETS_ROLE'],
+    )
+    consul = consulate.Consul(
+        host=os.getenv('CONSUL_HOST', 'localhost'),
+        scheme=os.getenv('CONSUL_SCHEME', 'https'),
+        port=os.getenv('CONSUL_PORT', 8500),
+        token=consul_secrets_role['data']['token'],
+        datacenter='us-west-2',
+    )
+    lock = consulate.api.Lock(
+        consul.base_uri,
+        consul._adapter,
+        consul._session,
+        consul.datacenter,
+        consul.token,
+    )
 
     # Map the terminating EC2 instance's ID to the corresponding nomad node ID
     nomad_api = Nomad(
@@ -243,7 +363,23 @@ def handle_asg_lifecycle_event(event, context) -> dict:
         node_id=node_id,
     )
 
+    # TODO: only deregister if "safe" to do soe
+    if target_group_arns := os.getenv('LB_TARGET_GROUP_ARNS', '').split(','):
+        for target_group_arn in target_group_arns:
+            targets_list = {
+                'Id': event['detail']['EC2InstanceId'],
+            }
+            elb_client = boto3.client('elbv2')
+            reg_targets_response = elb_client.deregister_targets(
+                TargetGroupArn=target_group_arn,
+                Targets=targets_list,
+            )
+            if reg_targets_response['ResponseMetadata']['HTTPStatusCode'] != 200:
+                raise Exception("Deregister targets failed")
+
     # Check to see if we're ready to terminate the associated nomad node.
+    # with consul.lock.acquire('nomad-asg-drain-lambda'):
+    # with lock.acquire('nomad-asg-drain-lambda'):
     ready_for_termination = is_node_ready_for_termination(
         nomad_api=nomad_api,
         node_id=node_id,
@@ -261,3 +397,30 @@ def handle_asg_lifecycle_event(event, context) -> dict:
         'ready_for_termination': ready_for_termination,
         'max_wait_time_exceeded': max_wait_time_exceeded,
     }
+
+
+def handle_asg_lifecycle_event(event, context) -> dict:
+    """Handle Nomad node ASG lifecycle events.
+
+    Note: Currently only intended to handle "terminate lifecycle" actions.
+
+    Args:
+        event: ASG Lifecycle event data provided by AWS.
+        context: Runtime information for the lambda.
+
+    Raises:
+        NotImplementedError: Raised when we receive an event with a "detail-type" other than:
+        "EC2 Instance-terminate Lifecycle Action".
+
+    Returns:
+        dict: Includes both relevant details from the original event (so that this function can call itself with its
+        own outputs) as well as information about any actions taken (e.g., if the instance was ready for termination, etc.)
+    """
+
+    if event['detail-type'] == 'EC2 Instance-launch Lifecycle Action':
+        return handle_instance_launch()
+
+    if event['detail-type'] == 'EC2 Instance-terminate Lifecycle Action':
+        return handle_instance_terminate()
+
+    raise NotImplementedError('Only EC2 instance launch and terminate lifecycle notifications currently supported')

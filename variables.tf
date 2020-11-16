@@ -20,6 +20,12 @@ variable "subnet_ids" {
   default     = []
 }
 
+variable "target_group_arns" {
+  description = "An optional list of aws_alb_target_group ARNs that launching instances placed in / terminating instances removed from."
+  type        = list(string)
+  default     = []
+}
+
 variable "vpc_id" {
   type        = string
   description = "The ID of the VPC housing the associated nomad client ASG."

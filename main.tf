@@ -26,6 +26,58 @@ data "aws_iam_policy_document" "events_assume_role" {
 # regardless of what the ASG is named.
 resource "random_uuid" "drain_lambda" {}
 
+
+resource "aws_autoscaling_lifecycle_hook" "nomad_clients_launching" {
+  name                   = "nomad-client-launching"
+  autoscaling_group_name = var.asg_name
+  default_result         = "CONTINUE"
+  heartbeat_timeout      = 600
+    lifecycle_transition = "autoscaling:EC2_INSTANCE_LAUNCHING"
+  notification_metadata = jsonencode({
+    drain_lambda_uuid = random_uuid.drain_lambda.result
+  })
+}
+
+#
+# CloudWatch-related resources to propagate Nomad ASG termination lifecycle events into
+# the associated state machine.
+#
+resource "aws_cloudwatch_event_rule" "nomad_asg_launch_lifecycle_event" {
+  name_prefix = "nomad-client-drainer-"
+  description = "Capture nomad instance terminate lifecycle actions"
+
+  event_pattern = jsonencode({
+    source = ["aws.autoscaling"],
+    detail-type = [
+      "EC2 Instance-launch Lifecycle Action",
+    ],
+    detail = {
+      NotificationMetadata = {
+
+          drain_lambda_uuid = ["${random_uuid.drain_lambda.result}"]
+      }
+      LifecycleHookName = [
+
+            "${aws_autoscaling_lifecycle_hook.nomad_clients_launching.name}",
+      ]
+    }
+  })
+}
+
+resource "aws_lambda_permission" "asg_handler" {
+  statement_id  = "AllowCloudWatchEventsToInvokeAsgLifecycleLambda"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.nomad_asg_launch_lifecycle_event.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.cloudwatch_event_handler.arn
+}
+
+resource "aws_cloudwatch_event_target" "nomad_asg_launch_lifecycle_event" {
+  rule     = aws_cloudwatch_event_rule.nomad_asg_launch_lifecycle_event.name
+  arn      = aws_lambda_function.nomad_asg_lifecycle_handler.arn
+  role_arn = aws_iam_role.cloudwatch_event_handler.arn
+}
+
 # Enable terminate lifecycle hooks for the Nomad clients ASG
 resource "aws_autoscaling_lifecycle_hook" "nomad_clients_draining" {
   name                   = "nomad-client-draining"
@@ -38,10 +90,6 @@ resource "aws_autoscaling_lifecycle_hook" "nomad_clients_draining" {
   })
 }
 
-#
-# CloudWatch-related resources to propagate Nomad ASG termination lifecycle events into
-# the associated state machine.
-#
 resource "aws_cloudwatch_event_rule" "nomad_asg_terminate_lifecycle_event" {
   name_prefix = "nomad-client-drainer-"
   description = "Capture nomad instance terminate lifecycle actions"
@@ -315,6 +363,7 @@ resource "aws_lambda_function" "nomad_asg_lifecycle_handler" {
       MAX_WAIT_TIME_MINUTES       = 125
       NOMAD_ADDR                  = var.nomad_address
       NODE_NAME_FORMAT            = "nomad-client-{instance_id}"
+      LB_TARGET_GROUP_ARNS = join(",", var.target_group_arns)
     }
   }
 }
